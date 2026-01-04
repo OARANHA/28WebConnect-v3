@@ -1,0 +1,434 @@
+# ========================================
+# 28HUB CONNECT ENTERPRISE - Production Ready
+# Version: 2.0
+# Description: Production-ready Docker Compose configuration
+# Architecture: 6 Services (Infrastructure + Application + Integration + Proxy)
+# ========================================
+
+name: 28hubconnect
+
+# ========================================
+# YAML ANCHORS - Common Configurations
+# ========================================
+x-base: &base
+  restart: unless-stopped
+  networks:
+    - hub
+
+x-healthcheck-base: &healthcheck-base
+  interval: 10s
+  timeout: 5s
+  retries: 5
+  start_period: 30s
+
+# ========================================
+# SERVICES
+# ========================================
+services:
+
+  # ========================================
+  # INFRASTRUCTURE LAYER
+  # ========================================
+
+  # PostgreSQL 15 - Primary Database
+  # Stores data for both evo-ai and evolution-api
+  postgres:
+    <<: *base
+    image: postgres:15-alpine
+    container_name: hub_postgres
+    environment:
+      POSTGRES_MULTIPLE_DATABASES: "evolution_db,evo_ai"
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_INITDB_ARGS: "-E UTF8"
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      <<: *healthcheck-base
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d evo_ai"]
+    networks:
+      - hub
+
+  # Redis 7 - Cache and Message Queue
+  # Used for caching, sessions, and job queues
+  redis:
+    <<: *base
+    image: redis:7-alpine
+    container_name: hub_redis
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      <<: *healthcheck-base
+      test: ["CMD", "redis-cli", "ping"]
+    networks:
+      - hub
+
+  # MinIO - S3 Compatible Object Storage
+  # Stores media files, documents, and attachments
+  # Updated to latest stable version (2024)
+  minio:
+    <<: *base
+    image: minio/minio:RELEASE.2024-01-16T16-07-38Z
+    container_name: hub_minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    ports:
+      - "${MINIO_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - miniodata:/data
+    healthcheck:
+      <<: *healthcheck-base
+      test: ["CMD-SHELL", "sh -c 'echo > /dev/tcp/127.0.0.1/9000'"]
+    networks:
+      - hub
+
+  # PostgreSQL 15 - N8N Database
+  # Dedicated database for n8n workflow automation platform
+  n8n-postgres:
+    <<: *base
+    image: postgres:15-alpine
+    container_name: hub_n8n_postgres
+    environment:
+      POSTGRES_DB: n8n_db
+      POSTGRES_USER: n8n
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_INITDB_ARGS: "-E UTF8"
+    volumes:
+      - n8n_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      <<: *healthcheck-base
+      test: ["CMD-SHELL", "pg_isready -U n8n -d n8n_db"]
+    networks:
+      - hub
+
+  # ========================================
+  # APPLICATION LAYER
+  # ========================================
+
+  # EvoAI Backend - Python/FastAPI
+  # Main application backend for AI agents and automation
+  evoai-backend:
+    <<: *base
+    build:
+      context: ./evo-ai
+      dockerfile: Dockerfile
+    container_name: hub_evoai_backend
+    env_file:
+      - ./.env
+    environment:
+      HOST: 0.0.0.0
+      PORT: 8000
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      DEBUG: ${DEBUG:-true}
+      POSTGRES_CONNECTION_STRING: ${POSTGRES_CONNECTION_STRING}
+      REDIS_URL: ${EVOAI_REDIS_URL}
+      REDIS_HOST: redis
+      REDIS_PORT: ${REDIS_PORT:-6379}
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-""}
+      EVOLUTION_API_BASE_URL: ${EVOLUTION_API_BASE_URL}
+      AUTHENTICATION_API_KEY: ${EVOLUTION_API_APIKEY}
+      AUTHENTICATION_EXPOSE_IN_FETCH_INSTANCES: "true"
+      EVOAI_AGENT_URL: ${EVOAI_AGENT_URL}
+      EVOAI_AGENT_APIKEY: ${EVOAI_AGENT_APIKEY}
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY}
+      ADMIN_INITIAL_PASSWORD: "Admin@123456"
+      ADMIN_EMAIL: ${ADMIN_EMAIL}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY}
+      AI_ENGINE: ${AI_ENGINE}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    command: ["bash", "-lc", "python scripts/run_seeders.py && uvicorn src.main:app --host 0.0.0.0 --port 8000 --reload"]
+    # Temporarily disabled healthcheck to allow seeders to run
+    # healthcheck:
+    #   <<: *healthcheck-base
+    #   test: ["CMD", "curl", "-f", "http://localhost:8000/"]
+    networks:
+      - hub
+
+  # EvoAI Frontend - Next.js
+  # Web interface for the application
+  evoai-frontend:
+    <<: *base
+    build:
+      context: ./evo-ai/frontend
+      dockerfile: Dockerfile
+    container_name: hub_evoai_frontend
+    env_file:
+      - ./.env
+    environment:
+      NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL}
+      NEXT_PUBLIC_API_URL: http://localhost:8000
+      PORT: 3000
+    depends_on:
+      - evoai-backend
+    ports:
+      - "8002:3000"
+    healthcheck:
+      <<: *healthcheck-base
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:3000"]
+    networks:
+      - hub
+
+  # ========================================
+  # INTEGRATION LAYER
+  # ========================================
+
+  # Evolution API v2.3.6 - WhatsApp Gateway
+  # Provides WhatsApp, Instagram, and other channel integrations
+  evolution-api:
+    <<: *base
+    build:
+      context: ./evolution-api
+      dockerfile: Dockerfile
+    container_name: hub_evolution_api
+    ports:
+      - "8080:8080"
+    env_file:
+      - ./.env
+    environment:
+      # Server Configuration
+      SERVER_NAME: evolution
+      SERVER_TYPE: http
+      SERVER_PORT: 8080
+      SERVER_URL: ${EVOLUTION_API_BASE_URL:-http://localhost:8080}
+      SERVER_DISABLE_DOCS: "false"
+      SERVER_DISABLE_MANAGER: "false"
+
+      # CORS Configuration
+      CORS_ORIGIN: "*"
+      CORS_METHODS: "POST,GET,PUT,DELETE"
+      CORS_CREDENTIALS: "true"
+
+      # Database Configuration
+      DATABASE_PROVIDER: postgresql
+      DATABASE_CONNECTION_URI: ${EVOLUTION_DATABASE_URL}
+      DATABASE_CONNECTION_CLIENT_NAME: evolution_exchange
+      DATABASE_SAVE_DATA_INSTANCE: "true"
+      DATABASE_SAVE_DATA_NEW_MESSAGE: "true"
+      DATABASE_SAVE_MESSAGE_UPDATE: "true"
+      DATABASE_SAVE_DATA_CONTACTS: "true"
+      DATABASE_SAVE_DATA_CHATS: "true"
+      DATABASE_SAVE_DATA_HISTORIC: "true"
+      DATABASE_SAVE_DATA_LABELS: "true"
+      DATABASE_SAVE_IS_ON_WHATSAPP: "true"
+      DATABASE_SAVE_IS_ON_WHATSAPP_DAYS: "7"
+      DATABASE_SAVE_MEDIA: "true"
+      DATABASE_DELETE_MESSAGE: "false"
+
+      # Redis Cache Configuration
+      CACHE_REDIS_ENABLED: "true"
+      CACHE_REDIS_URI: ${EVOLUTION_REDIS_URL}
+      CACHE_REDIS_PREFIX_KEY: evolution
+      CACHE_REDIS_TTL: "604800"
+      CACHE_REDIS_SAVE_INSTANCES: "true"
+      CACHE_LOCAL_ENABLED: "true"
+      CACHE_LOCAL_TTL: "86400"
+
+      # Authentication Configuration (CRITICAL!)
+      AUTHENTICATION_TYPE: apikey
+      AUTHENTICATION_API_KEY: ${EVOLUTION_API_APIKEY}
+      AUTHENTICATION_EXPOSE_IN_FETCH_INSTANCES: "true"
+
+      # Session Configuration
+      CONFIG_SESSION_PHONE_CLIENT: Evolution API
+      CONFIG_SESSION_PHONE_NAME: Chrome
+      CONFIG_SESSION_PHONE_VERSION: 2.3000.1031602186
+
+      # QR Code Configuration
+      QRCODE_LIMIT: "30"
+      QRCODE_COLOR: "#198754"
+
+      # Instance Configuration
+      DEL_INSTANCE: "false"
+      DEL_TEMP_INSTANCES: "true"
+
+      # Language Configuration
+      LANGUAGE: pt-BR
+
+      # Webhook Configuration
+      WEBHOOK_GLOBAL_ENABLED: "false"
+      WEBHOOK_GLOBAL_URL: http://n8n:5678/webhook/evolution
+      WEBHOOK_GLOBAL_WEBHOOK_BY_EVENTS: "false"
+      WEBHOOK_REQUEST_TIMEOUT_MS: "30000"
+      WEBHOOK_RETRY_MAX_ATTEMPTS: "10"
+      WEBHOOK_RETRY_INITIAL_DELAY_SECONDS: "5"
+      WEBHOOK_RETRY_USE_EXPONENTIAL_BACKOFF: "true"
+      WEBHOOK_RETRY_MAX_DELAY_SECONDS: "300"
+      WEBHOOK_RETRY_JITTER_FACTOR: "0.2"
+      WEBHOOK_RETRY_NON_RETRYABLE_STATUS_CODES: "400,401,403,404,422"
+
+      # WebSocket Configuration
+      WEBSOCKET_ENABLED: "true"
+      WEBSOCKET_GLOBAL_EVENTS: "true"
+      WEBSOCKET_ALLOWED_HOSTS: ""
+
+      # Log Configuration
+      LOG_LEVEL: "ERROR,WARN,DEBUG,INFO,LOG,VERBOSE,DARK,WEBHOOKS,WEBSOCKET"
+      LOG_COLOR: "true"
+      LOG_BAILEYS: error
+
+      # S3/MinIO Configuration (DISABLED - temporarily disabled due to initialization issue)
+      S3_ENABLED: "false"
+      S3_ENDPOINT: http://minio:9000
+      S3_ACCESS_KEY: ${MINIO_ROOT_USER}
+      S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
+      S3_BUCKET: ${MINIO_BUCKET}
+      S3_PORT: "9000"
+      S3_USE_SSL: "false"
+      S3_REGION: us-east-1
+      S3_SKIP_POLICY: "false"
+      S3_SAVE_VIDEO: "false"
+
+      # OpenAI Integration
+      OPENAI_ENABLED: "true"
+      OPENAI_API_KEY_GLOBAL: ${OPENAI_API_KEY:-}
+
+      # N8N Integration
+      N8N_ENABLED: "true"
+      N8N_BASE_URL: http://n8n:5678
+      N8N_API_KEY: ${N8N_API_KEY:-28hub-enterprise-2025}
+
+      # EvoAI Integration
+      EVOAI_ENABLED: "true"
+
+      # WhatsApp Business Configuration
+      WA_BUSINESS_TOKEN_WEBHOOK: evolution
+      WA_BUSINESS_URL: https://graph.facebook.com
+      WA_BUSINESS_VERSION: v18.0
+      WA_BUSINESS_LANGUAGE: en
+
+      # Metrics Configuration
+      PROMETHEUS_METRICS: "false"
+      METRICS_AUTH_REQUIRED: "false"
+
+      # Telemetry Configuration
+      TELEMETRY_ENABLED: "true"
+
+      # Event Emitter Configuration
+      EVENT_EMITTER_MAX_LISTENERS: "50"
+
+    volumes:
+      - evolution_data:/evolution
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    healthcheck:
+      <<: *healthcheck-base
+      test: ["CMD", "curl", "-f", "http://localhost:8080/"]
+    networks:
+      - hub
+
+  # N8N - Workflow Automation
+  # Visual workflow automation and integration platform
+  n8n:
+    <<: *base
+    image: n8nio/n8n:latest
+    container_name: hub_n8n
+    environment:
+      N8N_BASIC_AUTH_ACTIVE: "true"
+      N8N_BASIC_AUTH_USER: ${N8N_USER:-admin}
+      N8N_BASIC_AUTH_PASSWORD: ${N8N_PASSWORD:-admin}
+      N8N_HOST: 0.0.0.0
+      N8N_PORT: 5678
+      NODE_ENV: production
+      WEBHOOK_URL: http://n8n:5678/webhook
+      GENERIC_TIMEZONE: America/Sao_Paulo
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY:-}
+      # PostgreSQL Database Configuration
+      DB_TYPE: "postgresdb"
+      DB_POSTGRESDB_HOST: "n8n-postgres"
+      DB_POSTGRESDB_PORT: 5432
+      DB_POSTGRESDB_DATABASE: "n8n_db"
+      DB_POSTGRESDB_USER: "n8n"
+      DB_POSTGRESDB_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+    ports:
+      - "5678:5678"
+    volumes:
+      - n8n_data:/home/node/.n8n
+    depends_on:
+      n8n-postgres:
+        condition: service_healthy
+    healthcheck:
+      <<: *healthcheck-base
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:5678/healthz"]
+    networks:
+      - hub
+
+  # ========================================
+  # PROXY LAYER
+  # ========================================
+
+  # Nginx - Reverse Proxy
+  # Routes traffic to backend services
+  nginx:
+    <<: *base
+    image: nginx:1.25-alpine
+    container_name: hub_nginx
+    depends_on:
+      - evoai-frontend
+      - evoai-backend
+      - evolution-api
+      - minio
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    healthcheck:
+      <<: *healthcheck-base
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost/health"]
+    networks:
+      - hub
+
+# ========================================
+# NETWORKS
+# ========================================
+networks:
+  hub:
+    driver: bridge
+    name: hub_network
+
+# ========================================
+# VOLUMES
+# ========================================
+volumes:
+  # PostgreSQL data volume
+  pgdata:
+    name: hub_pgdata
+
+  # Redis data volume
+  redisdata:
+    name: hub_redisdata
+
+  # MinIO data volume
+  miniodata:
+    name: hub_miniodata
+
+  # Evolution API data volume
+  evolution_data:
+    name: hub_evolution_data
+
+  # N8N data volume
+  n8n_data:
+    name: hub_n8n_data
+
+  # N8N PostgreSQL data volume
+  n8n_pgdata:
+    name: hub_n8n_pgdata
