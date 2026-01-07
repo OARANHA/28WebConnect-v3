@@ -1,7 +1,10 @@
+import logging
 import httpx
 import asyncio
 from typing import Any, Dict, List, Optional, Callable
 from src.config.settings import settings
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_TIMEOUT = 15.0
 MAX_RETRIES = 3
@@ -51,11 +54,13 @@ class EvolutionApiService:
 
     async def create_instance(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         url = f"{self.base_url}/instance/create"
+
         async def _req():
             async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
                 resp = await client.post(url, headers=self._headers(), json=payload)
                 resp.raise_for_status()
                 return resp.json()
+
         return await self._with_retries(_req)
 
     async def connect_instance(self, instance: str) -> Dict[str, Any]:
@@ -86,22 +91,139 @@ class EvolutionApiService:
             resp.raise_for_status()
             return resp.json()
 
-    # Chatbot EvoAI integration (optional phase-1 wiring)
-    async def create_evoai_bot(self, instance_name: str, agent_url: str, api_key: str, extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        # Evolution-API expects instance context (commonly via query param) and evoai payload
-        url = f"{self.base_url}/chatbot/evoai/create"
-        params = {"instanceName": instance_name}
-        body = {
+    # ========== EvoAI Methods ==========
+    
+    async def create_evoai_bot(
+        self,
+        instance_name: str,
+        agent_url: str,
+        api_key: str,
+        options: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        """POST /evoai/create/{instanceName}"""
+        url = f"{self.base_url}/evoai/create/{instance_name}"
+
+        payload = {
             "enabled": True,
             "agentUrl": agent_url,
             "apiKey": api_key,
             "triggerType": "all",
+            "triggerOperator": "contains",
+            "triggerValue": "",
+            "expire": 0,
+            "keywordFinish": "",
+            "delayMessage": 1000,
+            "unknownMessage": "Desculpe, não entendi sua mensagem.",
+            "listeningFromMe": False,
+            "stopBotFromMe": False,
+            "keepOpen": False,
+            "debounceTime": 0,
+            "ignoreJids": []
         }
-        if extra:
-            body.update(extra)
+
+        if options:
+            payload.update(options)
+
+        logger.info(f"🔗 Criando EvoAI bot: {instance_name}")
+
         async def _req():
-            async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
-                resp = await client.post(url, headers=self._headers(), params=params, json=body)
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.post(url, headers=self._headers(), json=payload)
+                logger.info(f"📡 Response {resp.status_code}: {resp.text[:500]}")
                 resp.raise_for_status()
                 return resp.json()
+
+        return await self._with_retries(_req)
+
+    async def find_evoai_bots(self, instance_name: str) -> Dict[str, Any]:
+        """GET /evoai/find/{instanceName}"""
+        url = f"{self.base_url}/evoai/find/{instance_name}"
+        async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+            resp = await client.get(url, headers=self._headers())
+            resp.raise_for_status()
+            return resp.json()
+
+    async def fetch_evoai_bot(self, instance_name: str, bot_id: str) -> Dict[str, Any]:
+        """GET /evoai/fetch/{evoaiId}/{instanceName}"""
+        url = f"{self.base_url}/evoai/fetch/{bot_id}/{instance_name}"
+        async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+            resp = await client.get(url, headers=self._headers())
+            resp.raise_for_status()
+            return resp.json()
+
+    async def update_evoai_bot(
+        self,
+        bot_id: str,
+        instance_name: str,
+        updates: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """PUT /evoai/update/{evoaiId}/{instanceName}"""
+        url = f"{self.base_url}/evoai/update/{bot_id}/{instance_name}"
+        
+        async def _req():
+            async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+                resp = await client.put(url, headers=self._headers(), json=updates)
+                resp.raise_for_status()
+                return resp.json()
+        
+        return await self._with_retries(_req)
+
+    async def delete_evoai_bot(self, bot_id: str, instance_name: str) -> Dict[str, Any]:
+        """DELETE /evoai/delete/{evoaiId}/{instanceName}"""
+        url = f"{self.base_url}/evoai/delete/{bot_id}/{instance_name}"
+        async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+            resp = await client.delete(url, headers=self._headers())
+            resp.raise_for_status()
+            return resp.json()
+
+    async def evoai_settings(self, instance_name: str, settings_data: Dict[str, Any]) -> Dict[str, Any]:
+        """POST /evoai/settings/{instanceName}"""
+        url = f"{self.base_url}/evoai/settings/{instance_name}"
+        
+        async def _req():
+            async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+                resp = await client.post(url, headers=self._headers(), json=settings_data)
+                resp.raise_for_status()
+                return resp.json()
+        
+        return await self._with_retries(_req)
+
+    async def fetch_evoai_settings(self, instance_name: str) -> Dict[str, Any]:
+        """GET /evoai/fetchSettings/{instanceName}"""
+        url = f"{self.base_url}/evoai/fetchSettings/{instance_name}"
+        async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+            resp = await client.get(url, headers=self._headers())
+            resp.raise_for_status()
+            return resp.json()
+
+    async def change_evoai_status(self, instance_name: str, status_data: Dict[str, Any]) -> Dict[str, Any]:
+        """POST /evoai/changeStatus/{instanceName}"""
+        url = f"{self.base_url}/evoai/changeStatus/{instance_name}"
+        
+        async def _req():
+            async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+                resp = await client.post(url, headers=self._headers(), json=status_data)
+                resp.raise_for_status()
+                return resp.json()
+        
+        return await self._with_retries(_req)
+
+    async def fetch_evoai_sessions(self, instance_name: str, bot_id: str) -> Dict[str, Any]:
+        """GET /evoai/fetchSessions/{evoaiId}/{instanceName}"""
+        url = f"{self.base_url}/evoai/fetchSessions/{bot_id}/{instance_name}"
+        async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+            resp = await client.get(url, headers=self._headers())
+            resp.raise_for_status()
+            return resp.json()
+
+    async def evoai_ignore_jid(self, instance_name: str, ignore_data: Dict[str, Any]) -> Dict[str, Any]:
+        """POST /evoai/ignoreJid/{instanceName}"""
+        url = f"{self.base_url}/evoai/ignoreJid/{instance_name}"
+        
+        async def _req():
+            async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+                resp = await client.post(url, headers=self._headers(), json=ignore_data)
+                resp.raise_for_status()
+                return resp.json()
+        
         return await self._with_retries(_req)

@@ -41,15 +41,15 @@ class Settings(BaseSettings):
     """Project settings"""
 
     # API settings
-    API_TITLE: str = os.getenv("API_TITLE", "Evo AI API")
+    API_TITLE: str = os.getenv("API_TITLE", "28hub Ia")
     API_DESCRIPTION: str = os.getenv("API_DESCRIPTION", "API for executing AI agents")
     API_VERSION: str = os.getenv("API_VERSION", "1.0.0")
     API_URL: str = os.getenv("API_URL", "http://localhost:8000")
 
     # Organization settings
-    ORGANIZATION_NAME: str = os.getenv("ORGANIZATION_NAME", "Evo AI")
+    ORGANIZATION_NAME: str = os.getenv("ORGANIZATION_NAME", "28Hub AI")
     ORGANIZATION_URL: str = os.getenv(
-        "ORGANIZATION_URL", "https://evoai.evoapicloud.com"
+        "ORGANIZATION_URL", "https://28web.com.br"
     )
 
     # Database settings
@@ -125,9 +125,9 @@ class Settings(BaseSettings):
     LOGIN_LOCKOUT_MINUTES: int = int(os.getenv("LOGIN_LOCKOUT_MINUTES", 30))
 
     # Seeder settings
-    ADMIN_EMAIL: str = os.getenv("ADMIN_EMAIL", "admin@evoai.com")
+    ADMIN_EMAIL: str = os.getenv("ADMIN_EMAIL", "aranha.com@gmail.com")
     ADMIN_INITIAL_PASSWORD: str = os.getenv(
-        "ADMIN_INITIAL_PASSWORD", "strongpassword123"
+        "ADMIN_INITIAL_PASSWORD", "sara1nha1@"
     )
     DEMO_EMAIL: str = os.getenv("DEMO_EMAIL", "demo@example.com")
     DEMO_PASSWORD: str = os.getenv("DEMO_PASSWORD", "demo123")

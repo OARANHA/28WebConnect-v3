@@ -311,24 +311,82 @@ export const availableModels = [
   },
 
   // Mistral Premier Models
-  { value: "mistral/mixtral-8x7b", label: "Mixtral 8×7B (MoE, 128K context)", provider: "mistral" },
-  { value: "mistral/mixtral-8x22b", label: "Mixtral 8×22B (MoE, 128K context)", provider: "mistral" },
+  {
+    value: "mistral/mistral-large-2-v24.11",
+    label: "Mistral Large 2 (123B, 128K context)",
+    provider: "mistral",
+  },
+  {
+    value: "mistral/pixtral-large-v24.11",
+    label: "Pixtral Large (Multimodal, 128K context)",
+    provider: "mistral",
+  },
+  {
+    value: "mistral/mistral-medium-3-v07.05",
+    label: "Mistral Medium 3 (128K context)",
+    provider: "mistral",
+  },
+  {
+    value: "mistral/mistral-saba-v25.02",
+    label: "Mistral Saba (Middle East & South Asia, 32K context)",
+    provider: "mistral",
+  },
+  {
+    value: "mistral/ministral-8b-v24.10",
+    label: "Ministral 8B (128K context)",
+    provider: "mistral",
+  },
+  {
+    value: "mistral/ministral-3b-v24.10",
+    label: "Ministral 3B (128K context)",
+    provider: "mistral",
+  },
+  {
+    value: "mistral/mistral-small-3.1-v25.03",
+    label: "Mistral Small 3.1 (24B, Multimodal)",
+    provider: "mistral",
+  },
 
-  // Mistral Open-Source Models (VÁLIDOS)
+  // Mistral Open-Source Models
   {
-  value: "mistral/open-mistral-nemo",
-  label: "Mistral Nemo (12B, Code focus)",
-  provider: "mistral",
+    value: "mistral/mistral-7b",
+    label: "Mistral 7B (128K context)",
+    provider: "mistral",
   },
   {
-  value: "mistral/open-mixtral-8x22b",
-  label: "Mixtral 8×22B (MoE, 128K context)",
-  provider: "mistral",
+    value: "mistral/mixtral-8x7b",
+    label: "Mixtral 8×7B (MoE, 128K context)",
+    provider: "mistral",
   },
   {
-  value: "mistral/open-mixtral-8x7b",
-  label: "Mixtral 8×7B (MoE, 128K context)",
-  provider: "mistral",
+    value: "mistral/mixtral-8x22b",
+    label: "Mixtral 8×22B (MoE, 128K context)",
+    provider: "mistral",
+  },
+  {
+    value: "mistral/codestral-mamba-7b",
+    label: "Codestral Mamba 7B (Code, 128K context)",
+    provider: "mistral",
+  },
+  {
+    value: "mistral/codestral-22b",
+    label: "Codestral 22B (Code, non-commercial)",
+    provider: "mistral",
+  },
+  {
+    value: "mistral/mathstral-7b",
+    label: "Mathstral 7B (STEM, 32K context)",
+    provider: "mistral",
+  },
+  {
+    value: "mistral/mistral-nemo",
+    label: "Mistral Nemo (Code focus)",
+    provider: "mistral",
+  },
+  {
+    value: "mistral/pixtral-12b",
+    label: "Pixtral 12B (Multimodal, 128K context)",
+    provider: "mistral",
   },
 ];
 
@@ -352,9 +410,5 @@ export const availableModelProviders = [
   {
     value: "cohere",
     label: "Cohere",
-  },
-  {
-    value: "mistral",
-    label: "Mistral",
   },
 ];

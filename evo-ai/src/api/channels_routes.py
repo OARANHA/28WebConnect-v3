@@ -1,51 +1,37 @@
 """
 ┌──────────────────────────────────────────────────────────────────────────────┐
-│ @file: channels_routes.py                                                    │
-│ Channels API Routes                                                            │
+│ @file: channels_routes.py                                                   │
+│ Channels API Routes                                                         │
 └──────────────────────────────────────────────────────────────────────────────┘
 """
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, Body
 from sqlalchemy.orm import Session
 from typing import List, Optional, Dict, Any
 import logging
 import httpx
 from pydantic import BaseModel, Field
 import asyncio
-import uuid
+from uuid import UUID
 
 from src.config.database import get_db
-from src.core.jwt_middleware import get_jwt_token, get_current_user_client_id
+from src.core.jwt_middleware import get_jwt_token
 from src.config.settings import settings
 from src.services.audit_service import create_audit_log
-from src.services.channel_service import (
-    get_client_channels,
-    get_channel_by_instance,
-    create_channel_ownership,
-    verify_channel_ownership,
-    delete_channel_ownership,
-    update_channel_status,
-)
+import uuid  # ← ADICIONE (para UUID)
 
+# ═══════════════════════════════════════════════════════════════════════════
+# SCHEMAS
+# ═══════════════════════════════════════════════════════════════════════════
 
-# Pydantic schemas for request/response
 class ChannelCreateRequest(BaseModel):
     """Request schema for creating a new channel (Evolution-API instance)"""
-    instanceName: str = Field(
-        ...,
-        description="Name of the instance",
-        pattern=r"^[a-zA-Z0-9_-]{3,50}$",
-        min_length=3,
-        max_length=50
-    )
+    instanceName: str = Field(..., description="Name of the instance")
     qrcode: Optional[bool] = Field(True, description="Generate QR code")
     integration: Optional[str] = Field("WHATSAPP-BAILEYS", description="Integration type")
     token: Optional[str] = Field(None, description="Instance token (optional)")
     number: Optional[str] = Field(None, description="Phone number (optional)")
-    # For admins: optional client_id to assign the channel to a specific client
-    # If omitted and current user is a regular user, uses their client_id
-    # If omitted and current user is an admin, no ownership record is created
-    client_id: Optional[uuid.UUID] = Field(None, description="Client ID to assign (admin only)")
+    
     # Optional settings
     rejectCall: Optional[bool] = Field(False, description="Reject calls")
     msgCall: Optional[str] = Field(None, description="Message for rejected calls")
@@ -63,6 +49,32 @@ class ChannelCreateRequest(BaseModel):
     proxyUsername: Optional[str] = Field(None, description="Proxy username")
     proxyPassword: Optional[str] = Field(None, description="Proxy password")
 
+
+class EvoAISettingsOptions(BaseModel):
+    """Configurações avançadas do bot EvoAI"""
+    triggerType: Optional[str] = Field("all", description="Tipo de trigger: 'all' ou 'keyword'")
+    triggerOperator: Optional[str] = Field("contains", description="Operador: contains, equals, startsWith, endsWith, regex")
+    triggerValue: Optional[str] = Field("", description="Palavra-chave ou regex (vazio se triggerType='all')")
+    expire: Optional[int] = Field(0, description="Tempo de expiração da sessão em minutos (0 = nunca expira)")
+    keywordFinish: Optional[str] = Field("", description="Palavra-chave para encerrar sessão")
+    delayMessage: Optional[int] = Field(1000, description="Delay em ms antes de responder")
+    unknownMessage: Optional[str] = Field(
+        "Desculpe, não entendi. Pode reformular?", 
+        description="Mensagem quando bot não entende"
+    )
+    listeningFromMe: Optional[bool] = Field(False, description="Bot processa mensagens enviadas por você")
+    stopBotFromMe: Optional[bool] = Field(False, description="Bot para quando você envia mensagem")
+    keepOpen: Optional[bool] = Field(True, description="Manter sessão sempre aberta")
+    debounceTime: Optional[int] = Field(0, description="Tempo em ms para agrupar mensagens rápidas")
+    ignoreJids: Optional[List[str]] = Field([], description="Lista de JIDs para ignorar")
+
+
+class EvoAISettingsRequest(BaseModel):
+    """Request para configurar EvoAI"""
+    agent_id: str = Field(..., description="UUID do agente")
+    options: Optional[EvoAISettingsOptions] = Field(None, description="Configurações customizadas (opcional)")
+
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter(
@@ -71,6 +83,9 @@ router = APIRouter(
     responses={404: {"description": "Not found"}},
 )
 
+# ═══════════════════════════════════════════════════════════════════════════
+# ENDPOINTS DE CANAIS
+# ═══════════════════════════════════════════════════════════════════════════
 
 @router.get("/", status_code=status.HTTP_200_OK)
 @router.get("", status_code=status.HTTP_200_OK)
@@ -84,42 +99,13 @@ async def get_channels(
     db: Session = Depends(get_db),
     payload: dict = Depends(get_jwt_token)
 ):
-    """List channels for the authenticated user's client"""
+    """List all channels (instances from Evolution-API)"""
     try:
         from src.services.evolution_api_service import EvolutionApiService
         evo = EvolutionApiService()
         instances = await evo.fetch_instances()
         if debug:
             logger.warning(f"DEBUG Evolution fetchInstances: {instances}")
-        
-        # Get client_id from JWT token
-        client_id = get_current_user_client_id(payload)
-        is_admin = payload.get("is_admin", False)
-        
-        # Filter instances by client ownership
-        if client_id and not is_admin:
-            # Get channel records for this client
-            client_channels = get_client_channels(db, client_id)
-            logger.warning(f"DEBUG: Client {client_id} has {len(client_channels)} channel records")
-            # Filter instances to only those owned by this client
-            owned_instance_names = {ch.instance_name for ch in client_channels}
-            logger.warning(f"DEBUG: Owned instance names: {owned_instance_names}")
-            # Log all instance names from Evolution API for comparison
-            api_instance_names = [it.get("instanceName") or it.get("instance") or it.get("name") or it.get("id") for it in instances]
-            logger.warning(f"DEBUG: Evolution API returned instance names: {api_instance_names}")
-            # Use同じfallback logic as line 125 to get instance name
-            instances = [it for it in instances if (it.get("instanceName") or it.get("instance") or it.get("name") or it.get("id")) in owned_instance_names]
-            logger.warning(f"DEBUG: After filtering - {len(instances)} instances remain")
-        elif is_admin:
-            # Admin can see all channels
-            pass
-        else:
-            # No client_id and not admin - deny access
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Access denied: No client associated with this user"
-            )
-        
         channels = []
         # Build base list
         for it in instances or []:
@@ -157,10 +143,11 @@ async def get_channels(
             }
             if instance_name:
                 channels.append(base)
+
         # Enrichment: fetch state in parallel and merge (status + avatarUrl)
         async def enrich(ch):
             try:
-                state = await evo.get_connection_state(ch["id"])  # type: ignore[index]
+                state = await evo.get_connection_state(ch["id"])
                 if debug:
                     logger.warning(f"DEBUG Evolution connectionState({ch['id']}): {state}")
                 # Unwrap common envelope shapes from Evolution-API
@@ -178,7 +165,10 @@ async def get_channels(
                     or conn.get("connected") or conn.get("isConnected") or conn.get("online")
                     or device.get("online")
                 )
-                status_norm = str((raw.get("state") or raw.get("status") or raw.get("message") or conn.get("status") or conn.get("state") or device.get("status") or "")).strip().lower()
+                status_norm = str(
+                    (raw.get("state") or raw.get("status") or raw.get("message") 
+                     or conn.get("status") or conn.get("state") or device.get("status") or "")
+                ).strip().lower()
                 if connected_flag is True:
                     status = "connected"
                 elif status_norm in {"open", "connected", "online", "authenticated", "logged_in", "ready", "up"}:
@@ -189,7 +179,13 @@ async def get_channels(
                     status = "qr_pending"
                 else:
                     status = status_norm or ch.get("status")
-                avatar = raw.get("profilePictureUrl") or raw.get("profile_picture_url") or raw.get("avatar") or raw.get("picture") or conn.get("profilePictureUrl")
+                avatar = (
+                    raw.get("profilePictureUrl") 
+                    or raw.get("profile_picture_url") 
+                    or raw.get("avatar") 
+                    or raw.get("picture") 
+                    or (conn.get("profilePictureUrl") if isinstance(conn, dict) else None)
+                )
                 if status:
                     ch["status"] = status
                 if avatar:
@@ -197,12 +193,8 @@ async def get_channels(
             except Exception:
                 # ignore enrichment errors per instance
                 pass
-        # Limit concurrent enrichment to avoid overloading Evolution-API
-        semaphore = asyncio.Semaphore(5)
-        async def enrich_limited(ch):
-            async with semaphore:
-                await enrich(ch)
-        await asyncio.gather(*[enrich_limited(ch) for ch in channels])
+
+        await asyncio.gather(*[enrich(ch) for ch in channels])
         
         # Filtering
         def norm(v: Optional[str]):
@@ -233,18 +225,24 @@ async def get_channels(
         
         # audit
         try:
-            create_audit_log(db, payload.get("user_id") or payload.get("sub"), "list", "channel", details={"count": len(data), "total": total, "page": page, "limit": limit})
+            create_audit_log(
+                db,
+                payload.get("user_id") or payload.get("sub"),
+                "list",
+                "channel",
+                details={"count": len(data), "total": total, "page": page, "limit": limit},
+            )
         except Exception:
             pass
         return {"data": data, "total": total, "page": page, "limit": limit, "hasMore": hasMore}
-    except httpx.HTTPStatusError as he:  # type: ignore[name-defined]
+    except httpx.HTTPStatusError as he:
         logger.error(f"Evolution-API error: {he.response.status_code} - {he.response.text}")
         raise HTTPException(status_code=he.response.status_code, detail=he.response.text)
     except Exception as e:
         logger.error(f"Error getting channels: {str(e)}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Error getting channels"
+            detail="Error getting channels",
         )
 
 
@@ -255,100 +253,55 @@ async def create_channel(
     db: Session = Depends(get_db),
     payload: dict = Depends(get_jwt_token)
 ):
-    """Create a new channel (instance in Evolution-API) and optionally link to client"""
+    """
+    Create a new channel (instance in Evolution-API).
+    
+    ✅ SIMPLIFICADO: Apenas cria a instância, SEM vincular agente.
+    Usuário deve conectar ao WhatsApp primeiro, depois usar o endpoint
+    POST /channels/{instance}/evoai/settings para vincular agente.
+    """
     try:
         from src.services.evolution_api_service import EvolutionApiService
         evo = EvolutionApiService()
         
-        # Convert Pydantic model to dict and send to Evolution-API
+        # Convert Pydantic model to dict
         payload_dict = channel_data.model_dump(exclude_none=True)
+        
         # Normalize integration format to match Evolution-API expectations
         integ = str(payload_dict.get("integration") or "WHATSAPP-BAILEYS").upper().replace("_", "-")
         valid_integrations = {"WHATSAPP-BAILEYS", "WHATSAPP-BUSINESS", "EVOLUTION"}
         if integ not in valid_integrations:
             integ = "WHATSAPP-BAILEYS"
         payload_dict["integration"] = integ
+        
+        # Create instance in Evolution-API
+        logger.info(f"🔨 Criando instância: {channel_data.instanceName}")
         resp = await evo.create_instance(payload_dict)
+        logger.info(f"✅ Instância '{channel_data.instanceName}' criada com sucesso")
         
-        # Normalize integration type to generic channel type for database
-        # Map specific integration types to generic ones supported by check constraint
-        integration_mapping = {
-            "whatsapp-baileys": "whatsapp",
-            "whatsappbaileys": "whatsapp",
-            "whatsapp-business": "whatsapp",
-            "whatsapploud": "whatsapp",
-            "whatsappcloudapi": "whatsapp",
-            "whatsappcloud": "whatsapp",
-            "evolution": "whatsapp",
-            "instagram": "instagram",
-            "email": "email",
-            "sms": "sms",
-        }
-        channel_type_raw = integ.lower().replace("-", "")
-        channel_type = integration_mapping.get(channel_type_raw, channel_type_raw)
-        
-        # Fallback to whatsapp if type is not recognized
-        valid_types = {"whatsapp", "instagram", "email", "sms"}
-        if channel_type not in valid_types:
-            logger.warning(f"Unknown channel type '{channel_type}', mapping to 'whatsapp'")
-            channel_type = "whatsapp"
-        
-        # Determine client_id for ownership record
-        is_admin = payload.get("is_admin", False)
-        from_user_client_id = get_current_user_client_id(payload)
-        from_request_client_id = channel_data.model_dump(exclude_none=True).get("client_id")
-        
-        # Use client_id in this priority order:
-        # 1. client_id from request (admin only)
-        # 2. client_id from user's token (regular users)
-        # 3. None (admin without specifying a client - no ownership record)
-        if from_request_client_id:
-            if not is_admin:
-                raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail="Only administrators can specify a client_id"
-                )
-            client_id = from_request_client_id
-            logger.info(f"Admin creating channel {channel_data.instanceName} for client {client_id}")
-        elif from_user_client_id:
-            client_id = from_user_client_id
-            logger.info(f"User creating channel {channel_data.instanceName} for their client {client_id}")
-        elif is_admin:
-            # Admin creating without specifying client - just create instance, no ownership
-            client_id = None
-            logger.info(f"Admin creating channel {channel_data.instanceName} without ownership")
-        else:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Access denied: No client associated with this user"
-            )
-        
-        # Create ownership record only if client_id is provided
-        if client_id:
-            create_channel_ownership(
-                db,
-                client_id,
-                channel_data.instanceName,
-                channel_type,
-                payload_dict
-            )
-        
+        # Audit log
         try:
-            audit_details = {"request": payload_dict, "response": resp}
-            if client_id:
-                audit_details["client_id"] = str(client_id)
-            create_audit_log(db, payload.get("user_id") or payload.get("sub"), "create", "channel", resource_id=channel_data.instanceName, details=audit_details)
+            create_audit_log(
+                db, 
+                payload.get("user_id") or payload.get("sub"), 
+                "create", 
+                "channel", 
+                resource_id=channel_data.instanceName, 
+                details={"request": payload_dict, "response": resp}
+            )
         except Exception:
             pass
+            
         return resp
-    except httpx.HTTPStatusError as he:  # type: ignore[name-defined]
-        logger.error(f"Evolution-API error: {he.response.status_code} - {he.response.text}")
+        
+    except httpx.HTTPStatusError as he:
+        logger.error(f"❌ Evolution-API error: {he.response.status_code} - {he.response.text}")
         raise HTTPException(status_code=he.response.status_code, detail=he.response.text)
     except Exception as e:
-        logger.error(f"Error creating channel: {str(e)}")
+        logger.error(f"❌ Error creating channel: {str(e)}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Error creating channel"
+            detail=f"Error creating channel: {str(e)}"
         )
 
 
@@ -363,19 +316,28 @@ async def connect_channel(
     try:
         from src.services.evolution_api_service import EvolutionApiService
         evo = EvolutionApiService()
-        # Evolution-API connect returns qrCode when starting a session
         resp = await evo.connect_instance(instance)
         try:
-            create_audit_log(db, payload.get("user_id") or payload.get("sub"), "connect", "channel", resource_id=instance, details={"response": resp})
-        except Exception as audit_err:
-            logger.warning(f"Audit log failed for {instance}: {audit_err}")
+            create_audit_log(
+                db,
+                payload.get("user_id") or payload.get("sub"),
+                "connect",
+                "channel",
+                resource_id=instance,
+                details={"response": resp},
+            )
+        except Exception:
+            pass
         return resp
-    except httpx.HTTPStatusError as he:  # type: ignore[name-defined]
+    except httpx.HTTPStatusError as he:
         logger.error(f"Evolution-API error: {he.response.status_code} - {he.response.text}")
         raise HTTPException(status_code=he.response.status_code, detail=he.response.text)
     except Exception as e:
         logger.error(f"Error connecting channel: {str(e)}")
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Error connecting channel")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Error connecting channel",
+        )
 
 
 @router.get("/{instance}/state", status_code=status.HTTP_200_OK)
@@ -390,16 +352,26 @@ async def channel_state(
         evo = EvolutionApiService()
         resp = await evo.get_connection_state(instance)
         try:
-            create_audit_log(db, payload.get("user_id") or payload.get("sub"), "state", "channel", resource_id=instance, details={"response": resp})
-        except Exception as audit_err:
-            logger.warning(f"Audit log failed for {instance}: {audit_err}")
+            create_audit_log(
+                db,
+                payload.get("user_id") or payload.get("sub"),
+                "state",
+                "channel",
+                resource_id=instance,
+                details={"response": resp},
+            )
+        except Exception:
+            pass
         return resp
-    except httpx.HTTPStatusError as he:  # type: ignore[name-defined]
+    except httpx.HTTPStatusError as he:
         logger.error(f"Evolution-API error: {he.response.status_code} - {he.response.text}")
         raise HTTPException(status_code=he.response.status_code, detail=he.response.text)
     except Exception as e:
         logger.error(f"Error getting channel state: {str(e)}")
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Error getting channel state")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Error getting channel state",
+        )
 
 
 @router.delete("/{instance}/logout", status_code=status.HTTP_200_OK)
@@ -414,16 +386,26 @@ async def logout_channel(
         evo = EvolutionApiService()
         resp = await evo.logout_instance(instance)
         try:
-            create_audit_log(db, payload.get("user_id") or payload.get("sub"), "logout", "channel", resource_id=instance, details={"response": resp})
-        except Exception as audit_err:
-            logger.warning(f"Audit log failed for {instance}: {audit_err}")
+            create_audit_log(
+                db,
+                payload.get("user_id") or payload.get("sub"),
+                "logout",
+                "channel",
+                resource_id=instance,
+                details={"response": resp},
+            )
+        except Exception:
+            pass
         return resp
-    except httpx.HTTPStatusError as he:  # type: ignore[name-defined]
+    except httpx.HTTPStatusError as he:
         logger.error(f"Evolution-API error: {he.response.status_code} - {he.response.text}")
         raise HTTPException(status_code=he.response.status_code, detail=he.response.text)
     except Exception as e:
         logger.error(f"Error logging out channel: {str(e)}")
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Error logging out channel")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Error logging out channel",
+        )
 
 
 @router.delete("/{instance}", status_code=status.HTTP_200_OK)
@@ -432,63 +414,40 @@ async def delete_channel(
     db: Session = Depends(get_db),
     payload: dict = Depends(get_jwt_token)
 ):
-    """Delete an instance in Evolution-API and remove ownership"""
+    """Delete an instance in Evolution-API"""
     try:
-        # Get client_id from JWT token
-        from_user_client_id = get_current_user_client_id(payload)
-        is_admin = payload.get("is_admin", False)
-        
-        # Determine client_id for ownership verification
-        # Admins can delete channels without ownership check
-        # Regular users must own the channel
-        if is_admin:
-            # Admin can delete any channel - look up ownership to provide to API
-            channel = get_channel_by_instance(db, instance)
-            if channel:
-                client_id = channel.client_id
-            else:
-                # No ownership record found - admin can still delete the instance
-                client_id = None
-        elif from_user_client_id:
-            # Regular user must own the channel
-            client_id = from_user_client_id
-            if not verify_channel_ownership(db, instance, client_id):
-                raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail="Access denied: You do not own this channel"
-                )
-        else:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Access denied: No client associated with this user"
-            )
-        
         from src.services.evolution_api_service import EvolutionApiService
         evo = EvolutionApiService()
         resp = await evo.delete_instance(instance)
-        
-        # Remove ownership record (soft delete) if it exists
-        if client_id:
-            delete_channel_ownership(db, instance, client_id)
-        
         try:
-            audit_details = {"response": resp}
-            if client_id:
-                audit_details["client_id"] = str(client_id)
-            create_audit_log(db, payload.get("user_id") or payload.get("sub"), "delete", "channel", resource_id=instance, details=audit_details)
+            create_audit_log(
+                db,
+                payload.get("user_id") or payload.get("sub"),
+                "delete",
+                "channel",
+                resource_id=instance,
+                details={"response": resp},
+            )
         except Exception:
             pass
         return resp
-    except httpx.HTTPStatusError as he:  # type: ignore[name-defined]
+    except httpx.HTTPStatusError as he:
         logger.error(f"Evolution-API error: {he.response.status_code} - {he.response.text}")
         raise HTTPException(status_code=he.response.status_code, detail=he.response.text)
     except Exception as e:
         logger.error(f"Error deleting channel: {str(e)}")
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Error deleting channel")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Error deleting channel",
+        )
 
 
 @router.get("/_debug/raw", status_code=status.HTTP_200_OK)
-async def channels_debug_raw(instance: Optional[str] = None, db: Session = Depends(get_db), payload: dict = Depends(get_jwt_token)):
+async def channels_debug_raw(
+    instance: Optional[str] = None,
+    db: Session = Depends(get_db),
+    payload: dict = Depends(get_jwt_token)
+):
     """Return raw Evolution-API payloads to help diagnose mapping issues."""
     from src.services.evolution_api_service import EvolutionApiService
     evo = EvolutionApiService()
@@ -503,6 +462,7 @@ async def channels_debug_raw(instance: Optional[str] = None, db: Session = Depen
         logger.error(f"Error in channels debug raw: {e}")
         raise HTTPException(status_code=500, detail="Error fetching raw debug data")
 
+
 @router.get("/{instance}/qr", status_code=status.HTTP_200_OK)
 async def channel_qr(
     instance: str,
@@ -513,87 +473,299 @@ async def channel_qr(
     try:
         from src.services.evolution_api_service import EvolutionApiService
         evo = EvolutionApiService()
-        # Evolution-API does not have a dedicated QR endpoint in router, but connectionState may include qr state
         resp = await evo.get_connection_state(instance)
-        # Try common shapes
         if isinstance(resp, dict):
             qr = resp.get("qrcode") or resp.get("qrCode") or resp.get("qr")
             pairing = resp.get("pairingCode") or resp.get("pairing_code")
             ref = resp.get("ref") or resp.get("reference")
             if qr or pairing or ref:
                 try:
-                    create_audit_log(db, payload.get("user_id") or payload.get("sub"), "qr", "channel", resource_id=instance, details={"has_qr": bool(qr), "has_pairing": bool(pairing), "has_ref": bool(ref)})
+                    create_audit_log(
+                        db,
+                        payload.get("user_id") or payload.get("sub"),
+                        "qr",
+                        "channel",
+                        resource_id=instance,
+                        details={
+                            "has_qr": bool(qr),
+                            "has_pairing": bool(pairing),
+                            "has_ref": bool(ref),
+                        },
+                    )
                 except Exception:
                     pass
                 return {"qrcode": qr, "pairingCode": pairing, "ref": ref}
         return resp
-    except httpx.HTTPStatusError as he:  # type: ignore[name-defined]
+    except httpx.HTTPStatusError as he:
         logger.error(f"Evolution-API error: {he.response.status_code} - {he.response.text}")
         raise HTTPException(status_code=he.response.status_code, detail=he.response.text)
     except Exception as e:
         logger.error(f"Error fetching channel QR: {str(e)}")
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Error fetching channel QR")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Error fetching channel QR",
+        )
 
+# ═══════════════════════════════════════════════════════════════════════════
+# ✅ ENDPOINT PRINCIPAL: Configurar EvoAI (COM SETTINGS CUSTOMIZÁVEIS)
+# ═══════════════════════════════════════════════════════════════════════════
 
-@router.post("/{instance}/bot", status_code=status.HTTP_200_OK)
-async def link_evoai_bot(
+@router.post("/{instance}/evoai/settings", status_code=status.HTTP_200_OK)
+async def configure_evoai_settings(
     instance: str,
+    settings_data: EvoAISettingsRequest = Body(...),
     db: Session = Depends(get_db),
     payload: dict = Depends(get_jwt_token)
 ):
-    """Create/link EvoAI bot in Evolution-API for this instance."""
+    """
+    Configure EvoAI settings for a CONNECTED instance with a specific agent.
+    
+    ⚠️ IMPORTANTE: A instância deve estar CONECTADA antes de chamar este endpoint.
+    """
     try:
         from src.services.evolution_api_service import EvolutionApiService
+        from src.models.models import Agent, ApiKey
+        from src.utils.security import decrypt_key
+        
         evo = EvolutionApiService()
-        agent_url = settings.APP_URL.rstrip("/") + "/api/v1/agents/chatbot"
-        api_key = settings.JWT_SECRET_KEY  # or a dedicated bot key if configured
-        resp = await evo.create_evoai_bot(instance, agent_url, api_key)
+        agent_id = settings_data.agent_id
+        custom_options = settings_data.options
+        
+        logger.info(f"🤖 Configurando EvoAI para instância '{instance}' com agente '{agent_id}'")
+        
+        # ✅ PASSO 1: Verificar se instância está conectada
         try:
-            create_audit_log(db, payload.get("user_id") or payload.get("sub"), "bot_linked", "channel", resource_id=instance, details={"agentUrl": agent_url})
-        except Exception:
-            pass
-        return resp
-    except httpx.HTTPStatusError as he:  # type: ignore[name-defined]
-        logger.error(f"Evolution-API error: {he.response.status_code} - {he.response.text}")
-        raise HTTPException(status_code=he.response.status_code, detail=he.response.text)
-    except Exception as e:
-        logger.error(f"Error linking EvoAI bot: {str(e)}")
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Error linking EvoAI bot")
+            state = await evo.get_connection_state(instance)
 
+            # Desembrulhar possíveis envelopes
+            raw = state
+            if isinstance(raw, dict):
+                if isinstance(raw.get("instance"), dict):
+                    raw = raw["instance"]
+                elif isinstance(raw.get("response"), dict):
+                    raw = raw["response"]
+                elif isinstance(raw.get("data"), dict):
+                    raw = raw["data"]
 
-@router.post("/webhook/evolution", status_code=status.HTTP_200_OK)
-async def evolution_webhook(
-    webhook_data: dict,
-    db: Session = Depends(get_db)
-):
-    """Receive webhooks from Evolution-API to update channel status"""
-    try:
-        event = webhook_data.get("event")
-        instance = webhook_data.get("instance")
-        
-        if event == "connection.update":
-            data = webhook_data.get("data", {})
-            status_raw = data.get("state") or data.get("status") or "disconnected"
-            phone = data.get("phone") or data.get("phoneNumber")
-            avatar = data.get("profilePictureUrl") or data.get("profilePicUrl")
-            
-            # Normalize status
+            # Extrair status
+            status_raw = (
+                raw.get("state") or 
+                raw.get("status") or 
+                raw.get("connectionStatus") or
+                raw.get("message") or
+                (raw.get("connection") or {}).get("status") or
+                (raw.get("connection") or {}).get("state") or
+                ""
+            )
+
+            # Verificar flags booleanas
+            connected_flag = (
+                raw.get("connected") or 
+                raw.get("isConnected") or 
+                raw.get("online") or
+                (raw.get("connection") or {}).get("connected") or
+                (raw.get("device") or {}).get("online")
+            )
+
             status_norm = str(status_raw).strip().lower()
-            if status_norm in {"open", "connected", "online", "authenticated", "ready", "up"}:
-                status = "connected"
-            elif status_norm in {"close", "closed", "disconnected", "offline", "down"}:
-                status = "disconnected"
-            elif "qr" in status_norm or "pair" in status_norm:
-                status = "qr_pending"
-            else:
-                status = status_norm or "disconnected"
-            
-            # Update channel status in database
-            update_channel_status(db, instance, status, phone, avatar)
-            logger.info(f"Webhook: Updated channel {instance} status to {status}")
+
+            logger.info(f"🔍 Estado da instância '{instance}':")
+            logger.info(f"   Status raw: {status_raw}")
+            logger.info(f"   Status normalizado: {status_norm}")
+            logger.info(f"   Connected flag: {connected_flag}")
+
+            # ✅ Validação
+            is_connected = (
+                connected_flag is True or
+                status_norm in {"connected", "open", "online", "authenticated", "ready", "up"}
+            )
+
+            if not is_connected:
+                logger.warning(f"⚠️ Instância '{instance}' não está conectada")
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Instância '{instance}' não está conectada. Status: {status_raw or 'desconhecido'}"
+                )
+
+            logger.info(f"✅ Instância '{instance}' validada como conectada")
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"❌ Erro ao verificar estado: {e}", exc_info=True)
+            logger.warning("⚠️ Continuando sem validação (assume conectado)")
+
+        # ✅ PASSO 2: Buscar agente no banco de dados
+        try:
+            agent_uuid = UUID(agent_id)
+            agent = db.query(Agent).filter(Agent.id == agent_uuid).first()
+
+            if not agent:
+                logger.error(f"❌ Agente {agent_id} não encontrado no banco")
+                raise HTTPException(
+                    status_code=404, 
+                    detail=f"Agente {agent_id} não encontrado"
+                )
+
+            logger.info(f"✅ Agente encontrado: {agent.name} ({agent.type})")
+
+        except ValueError:
+            logger.error(f"❌ UUID inválido: {agent_id}")
+            raise HTTPException(
+                status_code=400, 
+                detail=f"UUID inválido: {agent_id}"
+            )
+
+        # ✅ PASSO 3: Construir URL do agente (SEM .well-known/agent.json)
+        # Usar URL base do agente, não agent_card_url
+        agent_url = f"{settings.APP_URL or 'http://evoai-backend:8000'}/api/v1/a2a/{agent.id}"
+        logger.info(f"🔗 URL do agente: {agent_url}")
+
+        # ✅ PASSO 4: Obter API key DO AGENTE (que já existe no banco)
+        api_key = None
         
-        return {"status": "ok"}
+        try:
+            # Buscar API key do agente no campo config
+            if hasattr(agent, 'config') and isinstance(agent.config, dict):
+                api_key = agent.config.get('api_key')
+                
+            if not api_key:
+                logger.error(f"❌ Agente {agent.id} não possui API key no config!")
+                raise HTTPException(
+                    status_code=400,
+                    detail="Agente não possui API key configurada. Por favor, recrie o agente."
+                )
+            
+            logger.info(f"🔑 Usando API key do agente: {api_key[:20]}...")
+                    
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"❌ Erro ao obter API key do agente: {e}")
+            raise HTTPException(
+                status_code=500,
+                detail=f"Erro ao buscar API key do agente: {str(e)}"
+            )
+        
+
+        # ✅ PASSO 5: Montar payload base do EvoAI
+        evoai_payload = {
+            "enabled": True,
+            "agentUrl": agent_url,  # ✅ CORRIGIDO: agentUrl, não apiUrl
+            "apiKey": api_key,
+            "triggerType": "all",
+            "triggerOperator": "contains",
+            "triggerValue": "",
+            "expire": 0,
+            "keywordFinish": "",
+            "delayMessage": 1000,
+            "unknownMessage": "Desculpe, não entendi sua mensagem.",
+            "listeningFromMe": False,
+            "stopBotFromMe": False,
+            "keepOpen": True,
+            "debounceTime": 0,
+            "ignoreJids": []
+        }
+        
+        # ✅ Aplicar configurações customizadas se fornecidas
+        if custom_options:
+            options_dict = custom_options.model_dump(exclude_none=True)
+            evoai_payload.update(options_dict)
+            logger.info(f"⚙️ Aplicando configurações customizadas: {options_dict}")
+
+        # ✅ PASSO 6: Configurar EvoAI no Evolution-API (com update se já existir)
+        logger.info(f"📡 Configurando EvoAI para instância '{instance}'")
+        
+        try:
+            # Tentar buscar bots existentes
+            existing_bots = await evo.find_evoai_bots(instance)
+            logger.info(f"🔍 Bots existentes encontrados: {existing_bots}")
+            
+            # Extrair lista de bots
+            bots_list = []
+            if isinstance(existing_bots, list):
+                bots_list = existing_bots
+            elif isinstance(existing_bots, dict):
+                bots_list = existing_bots.get("data") or existing_bots.get("response") or []
+            
+            if bots_list:
+                # UPDATE bot existente
+                bot_id = bots_list[0].get("id")
+                logger.info(f"🔄 Atualizando bot existente (ID: {bot_id})")
+                bot_resp = await evo.update_evoai_bot(
+                    bot_id=bot_id,
+                    instance_name=instance,
+                    updates=evoai_payload
+                )
+                logger.info(f"✅ Bot atualizado com sucesso")
+            else:
+                # CREATE novo bot
+                logger.info(f"➕ Criando novo bot EvoAI")
+                bot_resp = await evo.create_evoai_bot(
+                    instance_name=instance,
+                    agent_url=agent_url,
+                    api_key=api_key,
+                    options=evoai_payload
+                )
+                logger.info(f"✅ Bot criado com sucesso")
+                
+        except Exception as lookup_error:
+            logger.warning(f"⚠️ Fallback: erro ao buscar bots existentes - {lookup_error}")
+            # Fallback direto para create
+            bot_resp = await evo.create_evoai_bot(
+                instance_name=instance,
+                agent_url=agent_url,
+                api_key=api_key,
+                options=evoai_payload
+            )
+            logger.info(f"✅ Bot criado via fallback")
+
+        logger.info(f"🎉 EvoAI configurado com sucesso para '{instance}'")
+
+        # ✅ PASSO 7: Audit log
+        try:
+            create_audit_log(
+                db,
+                payload.get("user_id") or payload.get("sub"),
+                "evoai_configured",
+                "channel",
+                resource_id=instance,
+                details={
+                    "agent_id": str(agent.id),
+                    "agent_name": agent.name,
+                    "agent_type": agent.type,
+                    "agent_url": agent_url,
+                    "custom_options": bool(custom_options),
+                    "evolution_response": bot_resp
+                }
+            )
+        except Exception as e:
+            logger.warning(f"⚠️ Falha ao criar audit log: {e}")
+            
+        # ✅ PASSO 8: Retornar resposta estruturada
+        return {
+            "success": True,
+            "message": "Configuração EvoAI aplicada com sucesso",
+            "instance": instance,
+            "agent": {
+                "id": str(agent.id),
+                "name": agent.name,
+                "type": agent.type,
+                "model": agent.model,
+                "url": agent_url
+            },
+            "settings": evoai_payload,
+            "evolution_response": bot_resp
+        }
+
+    except httpx.HTTPStatusError as he:
+        logger.error(f"❌ Evolution-API error: {he.response.status_code} - {he.response.text}")
+        raise HTTPException(status_code=he.response.status_code, detail=he.response.text)
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Error processing Evolution webhook: {str(e)}")
-        # Always return 200 to Evolution-API to avoid retries
-        return {"status": "ok"}
+        logger.error(f"❌ Error configuring EvoAI: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error configuring EvoAI: {str(e)}"
+        )

@@ -28,8 +28,19 @@ import {
   MessageCircle,
   Mail,
   Send,
+  Bot,
 } from "lucide-react";
 import { useToast } from "@/hooks/use-toast";
+
+// ✅ Função auxiliar para extrair client_id do token
+const getClientIdFromToken = (token: string): string | null => {
+  try {
+    const payload = JSON.parse(atob(token.split('.')[1]));
+    return payload.client_id || null;
+  } catch {
+    return null;
+  }
+};
 
 export default function ChannelsPage() {
   const { toast } = useToast();
@@ -49,10 +60,20 @@ export default function ChannelsPage() {
   const [hasMore, setHasMore] = useState<boolean>(false);
   const debounceRef = useRef<NodeJS.Timeout | null>(null);
 
-  // create dialog
+  // create dialog (SEM agente)
   const [isCreateOpen, setIsCreateOpen] = useState(false);
   const [instanceName, setInstanceName] = useState("");
   const [isCreating, setIsCreating] = useState(false);
+  
+  // ✅ States para agentes (usado APENAS no modal de configuração)
+  const [agents, setAgents] = useState<any[]>([]);
+  const [isLoadingAgents, setIsLoadingAgents] = useState(false);
+
+  // ✅ Modal de configuração de agente (APÓS CONECTAR)
+  const [isConfigOpen, setIsConfigOpen] = useState(false);
+  const [configInstanceId, setConfigInstanceId] = useState<string>("");
+  const [selectedConfigAgentId, setSelectedConfigAgentId] = useState<string>("");
+  const [isLinkingBot, setIsLinkingBot] = useState(false);
 
   // delete confirm dialog
   const [isDeleteOpen, setIsDeleteOpen] = useState(false);
@@ -67,7 +88,6 @@ export default function ChannelsPage() {
   const [refText, setRefText] = useState<string | null>(null);
   const [currentInstance, setCurrentInstance] = useState<string | null>(null);
   const [statusText, setStatusText] = useState<string>("Aguardando leitura do QR...");
-  const [isLinkingBot, setIsLinkingBot] = useState(false);
   const pollingRef = useRef<NodeJS.Timeout | null>(null);
 
   useEffect(() => {
@@ -83,6 +103,79 @@ export default function ChannelsPage() {
     }, 500);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [search, statusFilter, typeFilter, page, limit]);
+
+  // ✅ Carregar agentes APENAS quando abrir o modal de configuração
+  useEffect(() => {
+    if (isConfigOpen) {
+      loadAgents();
+    }
+  }, [isConfigOpen]);
+
+  // ✅ Função loadAgents
+  const loadAgents = async () => {
+    setIsLoadingAgents(true);
+    try {
+      console.log('🔍 Carregando agentes...');
+      
+      const token = localStorage.getItem('access_token');
+      
+      if (!token) {
+        throw new Error('Token não encontrado. Faça login novamente.');
+      }
+      
+      const clientId = getClientIdFromToken(token);
+      
+      const headers: HeadersInit = {
+        'Authorization': `Bearer ${token}`,
+        'Content-Type': 'application/json'
+      };
+      
+      if (clientId) {
+        headers['X-Client-ID'] = clientId;
+      }
+      
+      const apiUrl = process.env.NEXT_PUBLIC_API_BASE_URL || 'http://localhost:8000';
+      const response = await fetch(`${apiUrl}/api/v1/agents/`, { headers });
+      
+      if (!response.ok) {
+        const errorText = await response.text();
+        console.error('Erro da API:', errorText);
+        throw new Error(`HTTP ${response.status}`);
+      }
+      
+      const data = await response.json();
+      
+      let agentsList = [];
+      if (Array.isArray(data)) {
+        agentsList = data;
+      } else if (data?.agents && Array.isArray(data.agents)) {
+        agentsList = data.agents;
+      } else if (data?.data && Array.isArray(data.data)) {
+        agentsList = data.data;
+      }
+      
+      console.log(`✅ ${agentsList.length} agente(s) carregado(s)`);
+      setAgents(agentsList);
+      
+      if (agentsList.length === 0) {
+        toast({ 
+          title: "Nenhum agente encontrado",
+          description: "Crie um agente primeiro na página de Agentes"
+        });
+      }
+      
+    } catch (error: any) {
+      console.error('❌ Erro ao carregar agentes:', error);
+      toast({ 
+        title: "Erro ao carregar agentes", 
+        description: error?.message || "Erro ao buscar agentes",
+        variant: "destructive" 
+      });
+      setAgents([]);
+    } finally {
+      setIsLoadingAgents(false);
+    }
+  };
 
   const loadChannels = async () => {
     setIsLoading(true);
@@ -134,7 +227,7 @@ export default function ChannelsPage() {
     stopPolling();
     pollingRef.current = setInterval(async () => {
       try {
-        const { getChannelState, linkEvoAiBot } = await import("@/services/channelService");
+        const { getChannelState } = await import("@/services/channelService");
         const state = await getChannelState(instance);
         const s = (state?.status || state?.state || state?.message || "").toString().toLowerCase();
         if (s) setStatusText(s);
@@ -149,12 +242,7 @@ export default function ChannelsPage() {
           setQrImage(img);
         }
         if (s.includes("connected")) {
-          try {
-            await linkEvoAiBot(instance);
-            toast({ title: `Instância ${instance} conectada e bot EvoAI vinculado!` });
-          } catch {
-            toast({ title: `Instância ${instance} conectada (falha ao vincular bot)`, variant: "destructive" });
-          }
+          toast({ title: `✅ Instância ${instance} conectada!` });
           await loadChannels();
           setIsQROpen(false);
           stopPolling();
@@ -231,15 +319,14 @@ export default function ChannelsPage() {
       const { deleteChannel } = await import("@/services/channelService");
       await deleteChannel(id);
       toast({ title: `Canal ${id} excluído` });
-      // Sync with backend to reflect server truth (e.g., counts)
       await loadChannels();
     } catch {
       toast({ title: `Falha ao excluir ${id}`, variant: "destructive" });
-      // Fallback: reload from server to restore original state
       await loadChannels();
     }
   };
 
+  // ✅ Função handleCreate SIMPLIFICADA (SEM agente)
   const handleCreate = async () => {
     if (!instanceName?.trim()) {
       toast({ title: "Informe o nome da instância", variant: "destructive" });
@@ -248,17 +335,118 @@ export default function ChannelsPage() {
     setIsCreating(true);
     try {
       const { createChannel } = await import("@/services/channelService");
-      await createChannel({ instanceName });
-      toast({ title: "Instância criada com sucesso" });
+      
+      const payload = {
+        instanceName: instanceName.trim()
+      };
+      
+      console.log('📦 Criando instância:', payload);
+      
+      await createChannel(payload);
+      
+      toast({ 
+        title: "✅ Instância criada!",
+        description: "Agora conecte ao WhatsApp. Depois você poderá vincular um agente."
+      });
+      
       setIsCreateOpen(false);
       setInstanceName("");
       await loadChannels();
-    } catch {
-      toast({ title: "Falha ao criar instância", variant: "destructive" });
+    } catch (error: any) {
+      console.error('❌ Erro ao criar canal:', error);
+      toast({ 
+        title: "Falha ao criar instância",
+        description: error?.message || "Erro desconhecido",
+        variant: "destructive" 
+      });
     } finally {
       setIsCreating(false);
     }
   };
+
+  // ✅ Abrir modal de configuração (APÓS conectar)
+  const handleOpenConfig = (instanceId: string) => {
+    setConfigInstanceId(instanceId);
+    setSelectedConfigAgentId("");
+    setIsConfigOpen(true);
+  };
+
+ // ✅ Vincular agente usando /evoai/settings (CORRIGIDO)
+  const handleLinkAgent = async () => {
+  if (!configInstanceId || !selectedConfigAgentId) {
+    toast({ 
+      title: "Selecione um agente",
+      variant: "destructive" 
+    });
+    return;
+  }
+  
+  setIsLinkingBot(true);
+  try {
+    const token = localStorage.getItem('access_token');
+    if (!token) throw new Error('Token não encontrado');
+    
+    const clientId = getClientIdFromToken(token);
+    const headers: HeadersInit = {
+      'Authorization': `Bearer ${token}`,
+      'Content-Type': 'application/json'
+    };
+    
+    if (clientId) {
+      headers['X-Client-ID'] = clientId;
+    }
+    
+    const apiUrl = process.env.NEXT_PUBLIC_API_BASE_URL || 'http://localhost:8000';
+    
+    console.log(`🤖 Vinculando agente ${selectedConfigAgentId} à instância ${configInstanceId}`);
+    
+    // ✅ CORRIGIDO: Envia agent_id no BODY, não na query string
+    const requestBody = {
+      agent_id: selectedConfigAgentId
+    };
+    
+    console.log('📦 Request body:', requestBody);
+    
+    // ✅ Chamar endpoint correto COM BODY
+    const response = await fetch(
+      `${apiUrl}/api/v1/channels/${configInstanceId}/evoai/settings`,
+      {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(requestBody)  // ✅ BODY aqui!
+      }
+    );
+    
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.error('❌ Erro da API:', errorText);
+      throw new Error(`HTTP ${response.status}: ${errorText}`);
+    }
+    
+    const result = await response.json();
+    console.log('✅ Resposta:', result);
+    
+    const linkedAgent = agents.find(a => a.id === selectedConfigAgentId);
+    toast({ 
+      title: `✅ Agente "${linkedAgent?.name}" vinculado!`,
+      description: "Bot EvoAI configurado e ativo. Aguardando mensagens..."
+    });
+    
+    setIsConfigOpen(false);
+    setSelectedConfigAgentId("");
+    await loadChannels();
+    
+  } catch (error: any) {
+    console.error('❌ Erro ao vincular agente:', error);
+    toast({ 
+      title: "Erro ao vincular agente",
+      description: error?.message || "Erro desconhecido",
+      variant: "destructive" 
+    });
+  } finally {
+    setIsLinkingBot(false);
+  }
+};
 
   if (isLoading) {
     return (
@@ -328,6 +516,8 @@ export default function ChannelsPage() {
               <option value={100}>100</option>
             </select>
           </div>
+          
+          {/* ✅ Dialog de Criação SIMPLIFICADO (SEM agente) */}
           <Dialog open={isCreateOpen} onOpenChange={setIsCreateOpen}>
             <DialogTrigger asChild>
               <Button className="gap-2">
@@ -337,26 +527,48 @@ export default function ChannelsPage() {
             </DialogTrigger>
             <DialogContent className="bg-neutral-950 text-white border-neutral-800">
               <DialogHeader>
-                <DialogTitle>Novo Canal (Instância WhatsApp)</DialogTitle>
+                <DialogTitle>Novo Canal WhatsApp</DialogTitle>
                 <DialogDescription>
-                  Crie uma nova instância na Evolution-API. Use um nome único.
+                  Crie uma nova instância. Use um nome único e descritivo.
                 </DialogDescription>
               </DialogHeader>
-              <div className="space-y-3">
+              <div className="space-y-4">
                 <div className="grid gap-2">
                   <Label htmlFor="instanceName">Nome da Instância</Label>
                   <Input
                     id="instanceName"
-                    placeholder="ex.: tenant-xyz-wa-01"
+                    placeholder="ex.: vendas-big28, suporte-empresa"
                     value={instanceName}
                     onChange={(e) => setInstanceName(e.target.value)}
+                    className="bg-neutral-900 border-neutral-700"
                   />
+                </div>
+                
+                {/* ✅ Informação sobre próximos passos */}
+                <div className="border border-blue-700/30 rounded-md p-3 bg-blue-900/10">
+                  <p className="text-xs text-blue-300 font-semibold mb-2">
+                    📱 Próximos passos após criar:
+                  </p>
+                  <ol className="text-xs text-neutral-300 ml-4 space-y-1 list-decimal">
+                    <li>Clicar em "Conectar" e escanear o QR code</li>
+                    <li>Aguardar a conexão ser estabelecida</li>
+                    <li>Clicar em "Vincular Agente" para ativar o bot</li>
+                  </ol>
                 </div>
               </div>
               <div className="flex justify-end gap-2 pt-2">
-                <Button variant="outline" onClick={() => setIsCreateOpen(false)} className="bg-neutral-900 border-neutral-700">Cancelar</Button>
-                <Button onClick={handleCreate} disabled={isCreating}>
-                  {isCreating ? "Criando..." : "Criar"}
+                <Button 
+                  variant="outline" 
+                  onClick={() => {
+                    setIsCreateOpen(false);
+                    setInstanceName("");
+                  }} 
+                  className="bg-neutral-900 border-neutral-700"
+                >
+                  Cancelar
+                </Button>
+                <Button onClick={handleCreate} disabled={isCreating || !instanceName.trim()}>
+                  {isCreating ? "Criando..." : "Criar Instância"}
                 </Button>
               </div>
             </DialogContent>
@@ -446,24 +658,15 @@ export default function ChannelsPage() {
                 <div className="flex gap-2">
                   {String(channel.status).toLowerCase() === "connected" ? (
                     <>
+                      {/* ✅ BOTÃO: Vincular Agente (só para canais conectados) */}
                       <Button
                         variant="outline"
                         size="sm"
-                        className="flex-1 bg-neutral-800 border-neutral-700 text-white hover:bg-neutral-700"
-                        onClick={async () => {
-                          try {
-                            setIsLinkingBot(true);
-                            const { linkEvoAiBot } = await import("@/services/channelService");
-                            await linkEvoAiBot(String(channel.id));
-                            toast({ title: `Bot vinculado a ${channel.id}` });
-                          } catch {
-                            toast({ title: `Falha ao vincular bot em ${channel.id}`, variant: "destructive" });
-                          } finally {
-                            setIsLinkingBot(false);
-                          }
-                        }}
+                        className="flex-1 bg-neutral-800 border-neutral-700 text-white hover:bg-neutral-700 gap-2"
+                        onClick={() => handleOpenConfig(String(channel.id))}
                       >
-                        {isLinkingBot ? "Vinculando..." : "Vincular Bot"}
+                        <Bot className="h-3 w-3" />
+                        Vincular Agente
                       </Button>
                       <Button
                         variant="destructive"
@@ -472,23 +675,6 @@ export default function ChannelsPage() {
                         onClick={() => handleLogout(String(channel.id))}
                       >
                         Desconectar
-                      </Button>
-                      <Button
-                        variant="destructive"
-                        size="sm"
-                        className="flex-1"
-                        onClick={async () => {
-                          try {
-                            const { deleteChannel } = await import("@/services/channelService");
-                            await deleteChannel(String(channel.id));
-                            toast({ title: `Canal ${channel.id} excluído` });
-                            await loadChannels();
-                          } catch {
-                            toast({ title: `Falha ao excluir ${channel.id}`, variant: "destructive" });
-                          }
-                        }}
-                      >
-                        Excluir
                       </Button>
                     </>
                   ) : (
@@ -501,16 +687,7 @@ export default function ChannelsPage() {
                         variant="destructive"
                         size="sm"
                         className="flex-1"
-                        onClick={async () => {
-                          try {
-                            const { deleteChannel } = await import("@/services/channelService");
-                            await deleteChannel(String(channel.id));
-                            toast({ title: `Canal ${channel.id} excluído` });
-                            await loadChannels();
-                          } catch {
-                            toast({ title: `Falha ao excluir ${channel.id}`, variant: "destructive" });
-                          }
-                        }}
+                        onClick={() => handleDelete(String(channel.id))}
                       >
                         Excluir
                       </Button>
@@ -522,7 +699,7 @@ export default function ChannelsPage() {
           </Card>
         ))}
 
-        {/* Add New Channel Card (secondary entry) */}
+        {/* Add New Channel Card */}
         <Card className="border-dashed border-neutral-700 hover:border-emerald-500/50 transition-colors cursor-pointer bg-neutral-900/50" onClick={() => setIsCreateOpen(true)}>
           <CardContent className="flex flex-col items-center justify-center h-full min-h-[280px]">
             <div className="p-4 rounded-full bg-neutral-800 mb-4">
@@ -533,6 +710,82 @@ export default function ChannelsPage() {
           </CardContent>
         </Card>
       </div>
+
+      {/* ✅ Modal de Configuração do Agente (APÓS CONECTAR) */}
+      <Dialog open={isConfigOpen} onOpenChange={setIsConfigOpen}>
+        <DialogContent className="bg-neutral-950 text-white border-neutral-800 max-w-2xl">
+          <DialogHeader>
+            <DialogTitle>Configurar Bot EvoAI</DialogTitle>
+            <DialogDescription>
+              Vincule um agente de IA para responder automaticamente às mensagens da instância <span className="font-mono text-emerald-400">{configInstanceId}</span>
+            </DialogDescription>
+          </DialogHeader>
+          
+          <div className="space-y-4">
+            {/* Seletor de Agente */}
+            <div className="grid gap-2">
+              <Label htmlFor="configAgentSelect">Selecionar Agente</Label>
+              {isLoadingAgents ? (
+                <div className="h-10 px-3 rounded-md bg-neutral-900 border border-neutral-700 text-neutral-400 flex items-center">
+                  Carregando agentes...
+                </div>
+              ) : (
+                <select
+                  id="configAgentSelect"
+                  className="h-10 px-3 rounded-md bg-neutral-900 border border-neutral-700 text-white"
+                  value={selectedConfigAgentId}
+                  onChange={(e) => setSelectedConfigAgentId(e.target.value)}
+                >
+                  <option value="">Selecione um agente</option>
+                  {agents.map((agent) => (
+                    <option key={agent.id} value={agent.id}>
+                      {agent.name} - {agent.type} ({agent.model})
+                    </option>
+                  ))}
+                </select>
+              )}
+              <p className="text-xs text-neutral-400">
+                {agents.length > 0 
+                  ? `${agents.length} agente(s) disponível(is)`
+                  : 'Nenhum agente encontrado. Crie um agente primeiro na página de Agentes'}
+              </p>
+            </div>
+            
+            {/* Informações sobre a Integração */}
+            <div className="border border-emerald-700/30 rounded-md p-4 bg-emerald-900/10">
+              <h3 className="text-sm font-semibold text-emerald-400 mb-2 flex items-center gap-2">
+                <Bot className="h-4 w-4" />
+                Como funciona
+              </h3>
+              <ul className="text-xs text-neutral-300 space-y-1 list-disc list-inside">
+                <li>O agente responderá automaticamente a <strong>todas as mensagens</strong> recebidas</li>
+                <li>Sessões ficam ativas continuamente (não expiram)</li>
+                <li>Mensagens do próprio bot não são processadas</li>
+                <li>Você pode trocar de agente ou desativar a qualquer momento</li>
+              </ul>
+            </div>
+          </div>
+          
+          <div className="flex justify-end gap-2 pt-2">
+            <Button 
+              variant="outline" 
+              onClick={() => {
+                setIsConfigOpen(false);
+                setSelectedConfigAgentId("");
+              }} 
+              className="bg-neutral-900 border-neutral-700"
+            >
+              Cancelar
+            </Button>
+            <Button 
+              onClick={handleLinkAgent} 
+              disabled={!selectedConfigAgentId || isLinkingBot}
+            >
+              {isLinkingBot ? "Vinculando..." : "Vincular Agente"}
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
 
       {/* Delete Confirm Modal */}
       <Dialog open={isDeleteOpen} onOpenChange={setIsDeleteOpen}>
@@ -558,12 +811,9 @@ export default function ChannelsPage() {
               onClick={async () => {
                 if (!pendingDeleteId) return;
                 try {
-                  const { deleteChannel } = await import("@/services/channelService");
-                  await deleteChannel(pendingDeleteId);
-                  toast({ title: `Canal ${pendingDeleteId} excluído` });
+                  await handleDelete(pendingDeleteId);
                   setIsDeleteOpen(false);
                   setPendingDeleteId(null);
-                  await handleDelete(pendingDeleteId);
                 } catch {
                   toast({ title: `Falha ao excluir ${pendingDeleteId}`, variant: "destructive" });
                 }
@@ -593,32 +843,14 @@ export default function ChannelsPage() {
             </DialogDescription>
           </DialogHeader>
           <div className="flex flex-col items-center gap-4">
-            <div className="flex gap-2">
-              <Button variant="outline" size="sm" className="bg-neutral-900 border-neutral-700" onClick={() => currentInstance && handleConnect(currentInstance)}>
-                Regerar QR
-              </Button>
-              {currentInstance && (
-                <Button
-                  variant="outline"
-                  size="sm"
-                  className="bg-neutral-900 border-neutral-700"
-                  onClick={async () => {
-                    try {
-                      setIsLinkingBot(true);
-                      const { linkEvoAiBot } = await import("@/services/channelService");
-                      await linkEvoAiBot(currentInstance);
-                      toast({ title: `Bot vinculado a ${currentInstance}` });
-                    } catch {
-                      toast({ title: `Falha ao vincular bot em ${currentInstance}` , variant: "destructive" });
-                    } finally {
-                      setIsLinkingBot(false);
-                    }
-                  }}
-                >
-                  {isLinkingBot ? "Vinculando..." : "Vincular Bot"}
-                </Button>
-              )}
-            </div>
+            <Button 
+              variant="outline" 
+              size="sm" 
+              className="bg-neutral-900 border-neutral-700" 
+              onClick={() => currentInstance && handleConnect(currentInstance)}
+            >
+              Regerar QR
+            </Button>
             {qrImage ? (
               <img src={qrImage} alt="QR Code" className="rounded bg-white p-2" />
             ) : (
